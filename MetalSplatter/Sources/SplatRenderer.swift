@@ -149,6 +149,12 @@ public final class SplatRenderer: @unchecked Sendable {
         get { sorter.onSortComplete }
         set { sorter.onSortComplete = newValue }
     }
+    /// Optional CPU phase timings for depth calculation, ordering, and
+    /// index-buffer output. Called from the sorter background task.
+    public var onSortPhaseTimings: (@Sendable (SplatSortPhaseTimings) -> Void)? {
+        get { sorter.onSortPhaseTimings }
+        set { sorter.onSortPhaseTimings = newValue }
+    }
 
     private let library: MTLLibrary
 
