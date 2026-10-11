@@ -40,7 +40,21 @@ enum BufferIndex: int32_t
     BufferIndexUniforms    = 0,
     BufferIndexChunks      = 1,
     BufferIndexSplatIndex  = 2,
+    BufferIndexReveal      = 3,
 };
+
+// Stable, per-point selection independent of CPU depth-sorted positions.
+inline bool revealIncludesSplat(uint chunkIndex, uint localIndex, float fraction) {
+    if (fraction >= 1.0f) { return true; }
+    if (fraction <= 0.0f) { return false; }
+    uint hash = (localIndex * 747796405u) ^ (chunkIndex * 2891336453u);
+    hash ^= hash >> 16;
+    hash *= 2246822519u;
+    hash ^= hash >> 13;
+    hash *= 3266489917u;
+    hash ^= hash >> 16;
+    return float(hash & 0x00ffffffu) * (1.0f / 16777216.0f) < fraction;
+}
 
 typedef struct
 {

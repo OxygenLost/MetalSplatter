@@ -6,6 +6,9 @@ import SplatIO
 import Synchronization
 
 public final class SplatRenderer: @unchecked Sendable {
+    /// Creative reveal effect; defaults to drawing every Gaussian.
+    /// Set only between render calls, never concurrently.
+    public var revealFraction: Float = 1
     enum Constants {
         // Keep in sync with Shaders.metal : maxViewCount
         static let maxViewCount = 2
@@ -50,6 +53,7 @@ public final class SplatRenderer: @unchecked Sendable {
         case uniforms    = 0
         case chunks      = 1
         case splatIndex  = 2
+        case reveal      = 3
     }
 
     // Keep in sync with Shaders.metal : Uniforms
@@ -924,6 +928,9 @@ public final class SplatRenderer: @unchecked Sendable {
         renderEncoder.setVertexBuffer(dynamicUniformBuffers, offset: renderState.uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
         renderEncoder.setVertexBuffer(chunksBuffer, offset: 0, index: BufferIndex.chunks.rawValue)
         renderEncoder.setVertexBuffer(splatIndexBuffer.buffer, offset: 0, index: BufferIndex.splatIndex.rawValue)
+        var fraction = revealFraction.isFinite ? min(max(revealFraction, 0), 1) : 1
+        renderEncoder.setVertexBytes(&fraction, length: MemoryLayout<Float>.size,
+                                     index: BufferIndex.reveal.rawValue)
 
         // Make splat and SH coefficient buffers resident for all chunks (enabled + disabled).
         // The shader may briefly access disabled chunks' pointers before the enabled check.
