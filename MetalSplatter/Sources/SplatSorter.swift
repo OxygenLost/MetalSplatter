@@ -1,7 +1,19 @@
 import Metal
 import simd
+import Foundation
 
 import Synchronization
+
+/// CPU stages of one completed depth sort. Values are measured on the sort
+/// task, independently from GPU command-buffer timing.
+public struct SplatSortPhaseTimings: Sendable {
+    public let pointCount: Int
+    public let depthMs: Double
+    public let orderingMs: Double
+    public let writeMs: Double
+    public let totalMs: Double
+    public let usedRadix: Bool
+}
 
 /**
  SplatSorter creates a sorted list of splat indices across multiple chunks. It is given a reference to
@@ -128,14 +140,77 @@ class SplatSorter: @unchecked Sendable {
     /// Called when a sort completes. The TimeInterval is the duration of the sort.
     /// Called from a background thread.
     var onSortComplete: (@Sendable (TimeInterval) -> Void)?
+    /// Optional fine-grained profiling callback. Called on a background task.
+    var onSortPhaseTimings: (@Sendable (SplatSortPhaseTimings) -> Void)?
 
     // Temporary storage for sorting (reused across iterations, only accessed from sort task)
     private var sortTempStorage: [SplatReferenceAndDepth] = []
+    // An exact 32-bit two-pass radix sort needs one reusable scratch buffer.
+    // The additional memory is bounded to 12 bytes per loaded splat.
+    private var radixScratchStorage: [SplatReferenceAndDepth] = []
+    private var radixHistogram = [Int](repeating: 0, count: 1 << 16)
 
     private struct SplatReferenceAndDepth {
         var chunkIndex: UInt16
         var splatIndex: UInt32
         var depth: Float
+    }
+
+    /// IEEE-754 monotonic key in descending Float order. Handles negative
+    /// depths too, for the alternative dot-product camera sorting mode.
+    @inline(__always)
+    private static func descendingKey(_ depth: Float) -> UInt32 {
+        let bits = depth.bitPattern
+        let ascending = (bits & 0x8000_0000) == 0 ? bits ^ 0x8000_0000 : ~bits
+        return ~ascending
+    }
+
+    private static func radixPass(
+        source: UnsafeBufferPointer<SplatReferenceAndDepth>,
+        destination: UnsafeMutableBufferPointer<SplatReferenceAndDepth>,
+        histogram: inout [Int],
+        shift: UInt32
+    ) {
+        histogram.withUnsafeMutableBufferPointer { count in
+            for i in 0..<count.count { count[i] = 0 }
+            for i in 0..<source.count {
+                let digit = Int((descendingKey(source[i].depth) >> shift) & 0xffff)
+                count[digit] += 1
+            }
+            var offset = 0
+            for i in 0..<count.count {
+                let n = count[i]
+                count[i] = offset
+                offset += n
+            }
+            for i in 0..<source.count {
+                let digit = Int((descendingKey(source[i].depth) >> shift) & 0xffff)
+                let position = count[digit]
+                destination[position] = source[i]
+                count[digit] = position + 1
+            }
+        }
+    }
+
+    private func radixSortByDepthDescending() {
+        let count = sortTempStorage.count
+        if radixScratchStorage.count != count {
+            radixScratchStorage = Array(repeating:
+                SplatReferenceAndDepth(chunkIndex: 0, splatIndex: 0, depth: 0),
+                count: count)
+        }
+        sortTempStorage.withUnsafeBufferPointer { source in
+            radixScratchStorage.withUnsafeMutableBufferPointer { destination in
+                Self.radixPass(source: source, destination: destination,
+                               histogram: &radixHistogram, shift: 0)
+            }
+        }
+        radixScratchStorage.withUnsafeBufferPointer { source in
+            sortTempStorage.withUnsafeMutableBufferPointer { destination in
+                Self.radixPass(source: source, destination: destination,
+                               histogram: &radixHistogram, shift: 16)
+            }
+        }
     }
 
     // MARK: - Initialization
@@ -590,6 +665,7 @@ class SplatSorter: @unchecked Sendable {
         chunkGeneration: UInt64
     ) async {
         let startTime = Date()
+        let startedAt = ProcessInfo.processInfo.systemUptime
         onSortStart?()
 
         // Calculate total splat count across all chunks
@@ -604,13 +680,16 @@ class SplatSorter: @unchecked Sendable {
 
         // Compute depth for each splat across all chunks
         var tempIndex = 0
+        var allFinite = true
         if SplatRenderer.Constants.sortByDistance {
             for chunk in chunks {
                 for i in 0..<chunk.buffer.count {
                     let position = chunk.buffer.values[i].position.simd
                     sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
                     sortTempStorage[tempIndex].splatIndex = UInt32(i)
-                    sortTempStorage[tempIndex].depth = (position - cameraPose.position).lengthSquared
+                    let depth = (position - cameraPose.position).lengthSquared
+                    sortTempStorage[tempIndex].depth = depth
+                    if !depth.isFinite { allFinite = false }
                     tempIndex += 1
                 }
             }
@@ -620,7 +699,9 @@ class SplatSorter: @unchecked Sendable {
                     let position = chunk.buffer.values[i].position.simd
                     sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
                     sortTempStorage[tempIndex].splatIndex = UInt32(i)
-                    sortTempStorage[tempIndex].depth = dot(position, cameraPose.forward)
+                    let depth = dot(position, cameraPose.forward)
+                    sortTempStorage[tempIndex].depth = depth
+                    if !depth.isFinite { allFinite = false }
                     tempIndex += 1
                 }
             }
@@ -632,7 +713,14 @@ class SplatSorter: @unchecked Sendable {
         }
 
         // Phase 2: Sort by depth (back to front, so larger depth first)
-        sortTempStorage.sort { $0.depth > $1.depth }
+        let depthFinishedAt = ProcessInfo.processInfo.systemUptime
+        if allFinite {
+            radixSortByDepthDescending()
+        } else {
+            // Keep existing behavior for non-finite PLY input.
+            sortTempStorage.sort { $0.depth > $1.depth }
+        }
+        let sortFinishedAt = ProcessInfo.processInfo.systemUptime
 
         // Phase 3: Write sorted indices to buffer
         do {
@@ -652,6 +740,7 @@ class SplatSorter: @unchecked Sendable {
             }
             return
         }
+        let writeFinishedAt = ProcessInfo.processInfo.systemUptime
 
         // Phase 4: Mark buffer as valid (unless invalidation was requested or chunks changed)
         let (wasInvalidated, completionHandlers) = state.withLock { state -> (Bool, [@Sendable () -> Void]) in
@@ -675,6 +764,13 @@ class SplatSorter: @unchecked Sendable {
         // Notify completion (even if invalidated, the sort work was done)
         if !wasInvalidated {
             let duration = -startTime.timeIntervalSinceNow
+            onSortPhaseTimings?(SplatSortPhaseTimings(
+                pointCount: totalSplatCount,
+                depthMs: (depthFinishedAt - startedAt) * 1000,
+                orderingMs: (sortFinishedAt - depthFinishedAt) * 1000,
+                writeMs: (writeFinishedAt - sortFinishedAt) * 1000,
+                totalMs: duration * 1000,
+                usedRadix: allFinite))
             onSortComplete?(duration)
 
             // Fire one-shot sort completion handlers outside the lock
