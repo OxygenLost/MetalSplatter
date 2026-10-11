@@ -511,12 +511,6 @@ class SplatSorter: @unchecked Sendable {
     }
 
     private func sortLoop() async {
-        defer {
-            state.withLock { state in
-                state.sortLoopRunning = false
-            }
-        }
-
         while !Task.isCancelled {
             // Check if we need to sort
             let sortParams = state.withLock { state -> (chunks: [ChunkReference], pose: CameraPose, bufferIndex: Int, chunkGeneration: UInt64)? in
@@ -553,9 +547,16 @@ class SplatSorter: @unchecked Sendable {
             }
 
             guard let params = sortParams else {
-                // Nothing to sort or no buffer available, check if we should exit or wait
+                // Do not spin at 1ms intervals when the camera is stationary.
+                // Mark the loop as stopped under the same lock that protects
+                // needsSort, so a concurrent update can safely start a new task.
                 let shouldExit = state.withLock { state -> Bool in
-                    !state.needsSort && state.chunks.isEmpty
+                    guard !state.needsSort || state.chunks.isEmpty else {
+                        return false
+                    }
+                    if state.chunks.isEmpty { state.needsSort = false }
+                    state.sortLoopRunning = false
+                    return true
                 }
 
                 if shouldExit {
@@ -573,6 +574,12 @@ class SplatSorter: @unchecked Sendable {
                 targetBufferIndex: params.bufferIndex,
                 chunkGeneration: params.chunkGeneration
             )
+        }
+
+        // The task may also exit after cancellation; a subsequent camera
+        // update can schedule a new loop.
+        state.withLock { state in
+            state.sortLoopRunning = false
         }
     }
 
