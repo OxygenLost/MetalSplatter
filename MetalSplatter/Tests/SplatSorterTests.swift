@@ -194,6 +194,43 @@ final class SplatSorterTests: XCTestCase {
         XCTAssertEqual(indexBuffer.values[2].chunkIndex, 2, "Third should be from chunk 2 (closest)")
     }
 
+    /// A larger deterministic check guards against digit-pass ordering,
+    /// index loss, and duplicate references when the exact radix backend is
+    /// selected. The permutation deliberately differs from depth order.
+    func testRadixLargeInputMatchesDepthComparison() async throws {
+        let count = 8191 // prime; multiplication by 37 permutes every index
+        let positions = (0..<count).map { i in
+            SIMD3<Float>(0, 0, -Float(((i * 37) % count) + 1) * 0.025)
+        }
+        let expected = positions.indices.sorted {
+            let lhs = positions[$0].z * positions[$0].z
+            let rhs = positions[$1].z * positions[$1].z
+            return lhs > rhs
+        }
+        let sorter = try SplatSorter(device: device)
+        sorter.setChunks([
+            try makeChunkReference(positions: positions, chunkIndex: 0)
+        ])
+        sorter.updateCameraPose(position: .zero,
+                                forward: SIMD3<Float>(0, 0, -1))
+        let result = await withTimeout(seconds: 4) {
+            await sorter.obtainSortedIndices()
+        }
+        guard let result else {
+            XCTFail("Exact radix backend did not return sorted indices")
+            return
+        }
+        defer { sorter.releaseSortedIndices(result) }
+        XCTAssertEqual(result.count, count)
+        let actual = (0..<result.count).map {
+            Int(result.values[$0].splatIndex)
+        }
+        XCTAssertEqual(actual, expected,
+                       "Radix must match the comparison sorter for finite depths")
+        XCTAssertEqual(Set(actual).count, count,
+                       "Radix must preserve every unique splat reference")
+    }
+
     // MARK: - Reference Counting Tests
 
     func testMultipleObtainsReturnSameBuffer() async throws {

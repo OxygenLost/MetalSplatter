@@ -479,8 +479,12 @@ class SplatSorter: @unchecked Sendable {
                 state.indexBuffers[i].isValid = false
             }
             state.mostRecentValidBufferIndex = nil
-            state.needsSort = true
+            state.needsSort = !state.chunks.isEmpty
         }
+        // The idle-sorter fix terminates its worker when there is no pending
+        // sort. Invalidation must start a new worker; otherwise callers can
+        // wait indefinitely for a new index buffer after idle teardown.
+        ensureSortLoopRunning()
     }
 
     // MARK: - Sort Completion Handlers
